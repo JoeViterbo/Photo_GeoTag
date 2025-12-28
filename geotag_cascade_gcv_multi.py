@@ -169,21 +169,17 @@ def resolve_hints(hints: Optional[str]) -> List[Tuple[float, float, str]]:
             pass
     return out
 
-def build_index_hint_map_from_file(plan_path: str) -> Tuple[Dict[int, Tuple[float, float, str]], List[str]]:
+def build_index_hint_map_from_data(data: List[Dict]) -> Tuple[Dict[int, Tuple[float, float, str]], List[str]]:
     """
-    Lee plan.json (lista de objetos {range:[start,end], hint:"Cadena compuesta"}).
+    Construye el mapa de índices a hints desde una lista de objetos {range:[start,end], hint:"Cadena"}.
     Geocodifica cada hint tal cual (no separa por comas).
     Devuelve {idx -> (lat, lon, hint)} y lista de errores.
     """
     errors: List[str] = []
     per_index_hint: Dict[int, Tuple[float, float, str]] = {}
-    try:
-        with open(plan_path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if not isinstance(data, list):
-            return {}, [f"plan_invalid_format: root must be a list"]
-    except Exception as e:
-        return {}, [f"plan_read_error:{e}"]
+    
+    if not isinstance(data, list):
+        return {}, [f"plan_invalid_format: root must be a list"]
 
     names: List[str] = []
     ranges: List[Tuple[int, int, str]] = []
@@ -223,6 +219,20 @@ def build_index_hint_map_from_file(plan_path: str) -> Tuple[Dict[int, Tuple[floa
             per_index_hint[idx] = (lat, lon, name)
 
     return per_index_hint, errors
+
+def build_index_hint_map_from_file(plan_path: str) -> Tuple[Dict[int, Tuple[float, float, str]], List[str]]:
+    """
+    Lee plan.json (lista de objetos {range:[start,end], hint:"Cadena compuesta"}).
+    Geocodifica cada hint tal cual (no separa por comas).
+    Devuelve {idx -> (lat, lon, hint)} y lista de errores.
+    """
+    try:
+        with open(plan_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as e:
+        return {}, [f"plan_read_error:{e}"]
+    
+    return build_index_hint_map_from_data(data)
 
 
 # ---------------------- Orden por fecha (no recursivo) --------------------
@@ -454,6 +464,71 @@ def gcv_text_detection(image_bytes: bytes, timeout_s: float = 20.0):
         return ("error", str(e))
 
 
+# ---------------------- Detección automática de tipo JSON -----------------
+def detect_json_type(data: List[Dict]) -> str:
+    """
+    Detecta si el JSON es formato single (range/hint) o multi (name/path/tags).
+    Retorna 'single', 'multi' o 'unknown'.
+    """
+    if not data or not isinstance(data, list) or len(data) == 0:
+        return 'unknown'
+    
+    first = data[0]
+    if not isinstance(first, dict):
+        return 'unknown'
+    
+    # Formato multi: tiene 'name' y 'tags'
+    if 'name' in first and 'tags' in first:
+        return 'multi'
+    
+    # Formato single: tiene 'range' y 'hint'
+    if 'range' in first and 'hint' in first:
+        return 'single'
+    
+    return 'unknown'
+
+# ---------------------- Multi-plan loader ---------------------------------
+def load_multi_plan(multi_plan_path: str, base_path: Optional[str] = None) -> List[Dict]:
+    """
+    Lee plan_multi.json (array de objetos con name, path, tags).
+    Devuelve lista de carpetas a procesar.
+    Si path está vacío, usa name como nombre de carpeta relativo a base_path.
+    """
+    try:
+        with open(multi_plan_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        
+        if not isinstance(data, list):
+            raise ValueError("plan_multi.json debe ser un array")
+        
+        folders = []
+        for entry in data:
+            name = entry.get("name", "")
+            path = entry.get("path", "").strip()
+            tags = entry.get("tags", [])
+            
+            if not name:
+                continue
+            
+            # Si path está vacío, construir desde base_path + name
+            if not path:
+                if base_path:
+                    folder_path = os.path.join(base_path, name)
+                else:
+                    folder_path = name
+            else:
+                folder_path = path
+            
+            folders.append({
+                "name": name,
+                "path": folder_path,
+                "tags": tags
+            })
+        
+        return folders
+    except Exception as e:
+        raise SystemExit(f"ERROR leyendo plan_multi.json: {e}")
+
 # ---------------------- Núcleo --------------------------------------------
 def process_folder(
     root: str,
@@ -465,8 +540,9 @@ def process_folder(
     gcv_timeout: float,
     verbose: bool,
     plan_path: Optional[str],
-    exiftool_path: str,
-    force: bool,
+    plan_data: Optional[List[Dict]] = None,
+    exiftool_path: str = "exiftool",
+    force: bool = False,
 ):
     # exiftool requerido para escribir (salvo dry-run)
     if not have_exiftool(exiftool_path) and not dry_run:
@@ -490,7 +566,9 @@ def process_folder(
     per_index_hint: Dict[int, Tuple[float, float, str]] = {}
     plan_errors: List[str] = []
     hint_coords: List[Tuple[float, float, str]] = []
-    if plan_path:
+    if plan_data is not None:
+        per_index_hint, plan_errors = build_index_hint_map_from_data(plan_data)
+    elif plan_path:
         per_index_hint, plan_errors = build_index_hint_map_from_file(plan_path)
     else:
         hint_coords = resolve_hints(hints_str)
@@ -502,7 +580,8 @@ def process_folder(
             lat, lon = known[f]
             last_known = (lat, lon, f"[seed:{os.path.basename(f)}]")
             break
-    if not plan_path and last_known is None and hint_coords:
+    has_plan = (plan_data is not None) or (plan_path is not None)
+    if not has_plan and last_known is None and hint_coords:
         lat, lon, name = hint_coords[0]
         last_known = (lat, lon, f"[seed-hint:{name}]")
 
@@ -529,7 +608,7 @@ def process_folder(
         log("plan_error", "(plan)", source=msg)
 
     # radio máximo en km alrededor del hint del plan
-    DEFAULT_MAX_KM_BIAS = 50.0
+    DEFAULT_MAX_KM_BIAS = 20.0
 
     # ---- Recorrido principal ----
     for idx, f in enumerate(tqdm(files, desc="Geotagging"), start=1):
@@ -714,7 +793,7 @@ def process_folder(
                     continue
 
         # 3) PLAN por rangos (preferente respecto a herencia)
-        if plan_path and per_index_hint:
+        if has_plan and per_index_hint:
             bias_coords, name = get_bias_from_plan_or_hint(per_index_hint, idx, hint_coords)
             if bias_coords:
                 lat, lon = bias_coords
@@ -761,7 +840,7 @@ def process_folder(
                     continue
 
         # 5) Semilla tardía con --hint global (solo si NO hay plan)
-        if not plan_path and hint_coords:
+        if not has_plan and hint_coords:
             lat, lon, name = hint_coords[0]
             note = f"assigned_hint_seed:{name}"
             if not dry_run:
@@ -784,8 +863,16 @@ def process_folder(
         # 6) Nada aplicable
         log("skip_no_source", f)
 
-    # Guardar CSV siempre como result.csv
-    out_csv = "result.csv"
+    # Guardar CSV: en modo multi-plan, usar nombre único por carpeta
+    if plan_data is not None:
+        # Modo multi-plan: usar nombre de carpeta en el CSV
+        folder_name = os.path.basename(root.rstrip(os.sep))
+        safe_name = re.sub(r'[^\w\-_\.]', '_', folder_name)
+        out_csv = f"result_{safe_name}.csv"
+    else:
+        # Modo single: usar result.csv
+        out_csv = "result.csv"
+    
     with open(out_csv, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=["file","action","lat","lon","source"])
         w.writeheader()
@@ -826,9 +913,11 @@ def get_gps_from_exif(path: str) -> Optional[Tuple[float, float]]:
 # ---------------------- CLI -----------------------------------------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("path", help="Carpeta con fotos (no recursivo)")
+    ap.add_argument("path", nargs="?", default=None, help="Carpeta con fotos (no recursivo). Requerido si no se usa --multi-plan")
     ap.add_argument("--hint", default=None, help="Ubicaciones separadas por coma (se usa el PRIMER hint si no hay plan)")
-    ap.add_argument("--file", dest="plan_path", default=None, help="Ruta JSON de plan por rangos (prioritario sobre herencia)")
+    ap.add_argument("--file", dest="plan_path", default=None, help="Ruta JSON de plan. Detecta automáticamente formato single (range/hint) o multi (name/path/tags)")
+    ap.add_argument("--multi-plan", default=None, help="Ruta JSON multi-carpeta (plan_multi.json). Procesa todas las carpetas listadas. Equivalente a --file con formato multi")
+    ap.add_argument("--base-path", default=None, help="Ruta base para construir paths cuando 'path' está vacío en multi-plan")
     ap.add_argument("--dry-run", action="store_true", help="No escribe EXIF (simulación)")
     ap.add_argument("--start-index", type=int, default=1,
                     help="Índice global de foto (ordenada) desde el que empezar a procesar")
@@ -842,16 +931,135 @@ if __name__ == "__main__":
                     help="Forzar escritura de localización aunque la foto ya tenga GPS")
 
     args = ap.parse_args()
-    process_folder(
-        root=args.path,
-        hints_str=args.hint,
-        dry_run=args.dry_run,
-        start_index=args.start_index,
-        end_index=args.end_index,
-        gcv_minconf=args.gcv_minconf,
-        gcv_timeout=args.gcv_timeout,
-        verbose=args.verbose,
-        plan_path=args.plan_path,
-        exiftool_path=args.exiftool_path,
-        force=args.force,
-    )
+    
+    # Si se especifica --file, detectar automáticamente el tipo de JSON
+    plan_file = args.multi_plan or args.plan_path
+    json_type = None
+    json_data = None
+    
+    if plan_file:
+        if not os.path.exists(plan_file):
+            raise SystemExit(f"ERROR: Archivo JSON '{plan_file}' no existe")
+        
+        try:
+            with open(plan_file, "r", encoding="utf-8") as fh:
+                json_data = json.load(fh)
+            
+            if not isinstance(json_data, list):
+                raise SystemExit(f"ERROR: El JSON debe ser un array")
+            
+            json_type = detect_json_type(json_data)
+            
+            if json_type == 'unknown':
+                raise SystemExit(f"ERROR: No se pudo detectar el tipo de JSON. Debe ser formato single (range/hint) o multi (name/path/tags)")
+            
+            if args.verbose:
+                print(f"[info] JSON detectado como formato: {json_type}")
+        
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"ERROR: JSON inválido: {e}")
+        except Exception as e:
+            raise SystemExit(f"ERROR leyendo JSON: {e}")
+    
+    # Modo multi-plan: procesar múltiples carpetas
+    if json_type == 'multi' or args.multi_plan:
+        if json_type != 'multi':
+            # Si se usó --multi-plan pero no se detectó como multi, usar load_multi_plan
+            folders = load_multi_plan(args.multi_plan, base_path=args.base_path)
+        else:
+            # Si se detectó automáticamente como multi desde --file
+            folders = []
+            for entry in json_data:
+                name = entry.get("name", "")
+                path = entry.get("path", "").strip()
+                tags = entry.get("tags", [])
+                
+                if not name:
+                    continue
+                
+                # Si path está vacío, construir desde base_path + name
+                if not path:
+                    if args.base_path:
+                        folder_path = os.path.join(args.base_path, name)
+                    else:
+                        folder_path = name
+                else:
+                    folder_path = path
+                
+                folders.append({
+                    "name": name,
+                    "path": folder_path,
+                    "tags": tags
+                })
+        
+        if args.verbose:
+            print(f"[info] Modo multi-plan: {len(folders)} carpetas a procesar")
+        
+        total_folders = len(folders)
+        for folder_idx, folder in enumerate(folders, start=1):
+            folder_path = folder["path"]
+            folder_name = folder["name"]
+            tags = folder["tags"]
+            
+            if args.verbose:
+                print(f"\n[{folder_idx}/{total_folders}] Procesando: {folder_name}")
+                print(f"  Ruta: {folder_path}")
+            
+            if not os.path.isdir(folder_path):
+                print(f"  [WARNING] Carpeta no existe: {folder_path}, saltando...")
+                continue
+            
+            # Procesar esta carpeta con sus tags como plan
+            process_folder(
+                root=folder_path,
+                hints_str=None,  # No usar hint global en modo multi-plan
+                dry_run=args.dry_run,
+                start_index=args.start_index,
+                end_index=args.end_index,
+                gcv_minconf=args.gcv_minconf,
+                gcv_timeout=args.gcv_timeout,
+                verbose=args.verbose,
+                plan_path=None,
+                plan_data=tags,  # Pasar los tags directamente
+                exiftool_path=args.exiftool_path,
+                force=args.force,
+            )
+        
+        if args.verbose:
+            print(f"\n[info] Procesamiento multi-plan completado")
+    
+    # Modo single: procesar una sola carpeta
+    else:
+        if not args.path:
+            raise SystemExit("ERROR: Se requiere 'path' o un archivo JSON (--file o --multi-plan)")
+        
+        if not os.path.isdir(args.path):
+            raise SystemExit(f"ERROR: '{args.path}' no es un directorio válido")
+        
+        # Si hay plan_path o se detectó como single, usar ese plan
+        plan_data_for_single = None
+        plan_path_for_single = None
+        
+        if json_type == 'single':
+            # Usar los datos del JSON detectado
+            plan_data_for_single = json_data
+            if args.verbose:
+                print(f"[info] Usando plan desde JSON (formato single)")
+        elif args.plan_path:
+            # Usar el plan_path tradicional
+            plan_path_for_single = args.plan_path
+        
+        process_folder(
+            root=args.path,
+            hints_str=args.hint,
+            dry_run=args.dry_run,
+            start_index=args.start_index,
+            end_index=args.end_index,
+            gcv_minconf=args.gcv_minconf,
+            gcv_timeout=args.gcv_timeout,
+            verbose=args.verbose,
+            plan_path=plan_path_for_single,
+            plan_data=plan_data_for_single,
+            exiftool_path=args.exiftool_path,
+            force=args.force,
+        )
