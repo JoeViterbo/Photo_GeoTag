@@ -61,6 +61,73 @@ GENERIC_LABELS = {
     "train station","harbor","port"
 }
 
+# ---------------------- Configuración desde config.json --------------------
+DEFAULT_CONFIG = {
+    "gcv": {
+        "minconf": 0.60,
+        "timeout": 20.0
+    },
+    "geocoding": {
+        "timeout": 15.0,
+        "max_km_bias": 20.0,
+        "max_km_if_bias": 50.0
+    },
+    "exiftool": {
+        "path": "exiftool"
+    },
+    "output": {
+        "csv_prefix": "result"
+    }
+}
+
+_config_cache: Optional[Dict] = None
+
+def load_config(config_path: Optional[str] = None) -> Dict:
+    """
+    Carga configuración desde config.json.
+    Si no existe o hay error, usa valores por defecto.
+    Si config_path es None, busca config.json en el directorio del script.
+    """
+    global _config_cache
+    
+    if _config_cache is not None:
+        return _config_cache
+    
+    if config_path is None:
+        # Buscar config.json en el mismo directorio que el script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(script_dir, "config.json")
+    
+    config = DEFAULT_CONFIG.copy()
+    
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as fh:
+                user_config = json.load(fh)
+            
+            # Merge recursivo de configuración
+            def merge_dict(base: Dict, override: Dict) -> Dict:
+                result = base.copy()
+                for key, value in override.items():
+                    if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                        result[key] = merge_dict(result[key], value)
+                    else:
+                        result[key] = value
+                return result
+            
+            config = merge_dict(config, user_config)
+            
+        except Exception as e:
+            print(f"[WARNING] Error leyendo config.json: {e}. Usando valores por defecto.")
+    
+    _config_cache = config
+    return config
+
+def get_config_value(section: str, key: str, default=None):
+    """Obtiene un valor de configuración de forma segura."""
+    config = load_config()
+    return config.get(section, {}).get(key, default)
+
 def is_generic_label(name: str) -> bool:
     s = name.strip().lower()
     if len(s) < 4:
@@ -109,7 +176,9 @@ def photo_timestamp(path: str) -> datetime:
 
 
 # ---------------------- exiftool (escritura lossless) ---------------------
-def have_exiftool(exiftool_path="exiftool") -> bool:
+def have_exiftool(exiftool_path: Optional[str] = None) -> bool:
+    if exiftool_path is None:
+        exiftool_path = get_config_value("exiftool", "path", "exiftool")
     try:
         subprocess.run([exiftool_path, "-ver"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -117,7 +186,9 @@ def have_exiftool(exiftool_path="exiftool") -> bool:
     except Exception:
         return False
 
-def write_gps_exiftool(path: str, lat: float, lon: float, note: Optional[str] = None, exiftool_path="exiftool"):
+def write_gps_exiftool(path: str, lat: float, lon: float, note: Optional[str] = None, exiftool_path: Optional[str] = None):
+    if exiftool_path is None:
+        exiftool_path = get_config_value("exiftool", "path", "exiftool")
     """
     Escribe GPS en EXIF + XMP. Incluye Refs y VersionID para máxima compatibilidad.
     Usa -P para preservar tiempos y luego hacemos touch() para reindexado.
@@ -156,13 +227,14 @@ def resolve_hints(hints: Optional[str]) -> List[Tuple[float, float, str]]:
     """Resuelve --hint global (coma separa múltiples hints). Se usa solo el primero."""
     if not hints:
         return []
+    geocode_timeout = get_config_value("geocoding", "timeout", 15.0)
     out = []
     for raw in hints.split(","):
         h = raw.strip()
         if not h:
             continue
         try:
-            loc = _geolocator.geocode(h, timeout=15)
+            loc = _geolocator.geocode(h, timeout=geocode_timeout)
             if loc:
                 out.append((loc.latitude, loc.longitude, h))
         except Exception:
@@ -200,9 +272,10 @@ def build_index_hint_map_from_data(data: List[Dict]) -> Tuple[Dict[int, Tuple[fl
             errors.append(f"plan_item_{i}_parse_error")
 
     name2coords: Dict[str, Optional[Tuple[float, float]]] = {}
+    geocode_timeout = get_config_value("geocoding", "timeout", 15.0)
     for name in names:
         try:
-            loc = _geolocator.geocode(name, timeout=15)
+            loc = _geolocator.geocode(name, timeout=geocode_timeout)
             name2coords[name] = (loc.latitude, loc.longitude) if loc else None
             if loc is None:
                 errors.append(f"hint_unresolved:{name}")
@@ -266,8 +339,11 @@ def list_media_sorted_by_capture(root: str) -> List[str]:
 def to_coords_with_bias(name: str,
                         bias: Optional[Tuple[float,float]] = None,
                         country_hint: Optional[str] = None,
-                        max_km_if_bias: Optional[float] = 50.0,
+                        max_km_if_bias: Optional[float] = None,
                         must_match_hint_tokens: Optional[List[str]] = None):
+    # Usar valor de configuración si no se especifica
+    if max_km_if_bias is None:
+        max_km_if_bias = get_config_value("geocoding", "max_km_if_bias", 50.0)
     # 0) descarta etiquetas genéricas tipo "summit"
     if is_generic_label(name):
         return None
@@ -325,8 +401,9 @@ def to_coords_with_bias(name: str,
                 continue
 
     # 2) Nominatim (más laxo, pero con las mismas barreras)
+    geocode_timeout = get_config_value("geocoding", "timeout", 15.0)
     try:
-        loc = _geolocator.geocode(query, timeout=15)
+        loc = _geolocator.geocode(query, timeout=geocode_timeout)
         if loc:
             if bias and max_km_if_bias is not None:
                 try:
@@ -607,8 +684,8 @@ def process_folder(
     for msg in plan_errors:
         log("plan_error", "(plan)", source=msg)
 
-    # radio máximo en km alrededor del hint del plan
-    DEFAULT_MAX_KM_BIAS = 20.0
+    # radio máximo en km alrededor del hint del plan (desde configuración)
+    DEFAULT_MAX_KM_BIAS = get_config_value("geocoding", "max_km_bias", 20.0)
 
     # ---- Recorrido principal ----
     for idx, f in enumerate(tqdm(files, desc="Geotagging"), start=1):
@@ -864,14 +941,15 @@ def process_folder(
         log("skip_no_source", f)
 
     # Guardar CSV: en modo multi-plan, usar nombre único por carpeta
+    csv_prefix = get_config_value("output", "csv_prefix", "result")
     if plan_data is not None:
         # Modo multi-plan: usar nombre de carpeta en el CSV
         folder_name = os.path.basename(root.rstrip(os.sep))
         safe_name = re.sub(r'[^\w\-_\.]', '_', folder_name)
-        out_csv = f"result_{safe_name}.csv"
+        out_csv = f"{csv_prefix}_{safe_name}.csv"
     else:
         # Modo single: usar result.csv
-        out_csv = "result.csv"
+        out_csv = f"{csv_prefix}.csv"
     
     with open(out_csv, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=["file","action","lat","lon","source"])
@@ -923,10 +1001,16 @@ if __name__ == "__main__":
                     help="Índice global de foto (ordenada) desde el que empezar a procesar")
     ap.add_argument("--end-index", type=int, default=None,
                     help="Índice global de foto (ordenada) hasta el que procesar (inclusive)")
-    ap.add_argument("--gcv-minconf", type=float, default=0.60, help="Confianza mínima para aceptar GCV landmark")
-    ap.add_argument("--gcv-timeout", type=float, default=20.0, help="Timeout por foto para Vision (segundos)")
+    # Cargar configuración para valores por defecto
+    config = load_config()
+    default_gcv_minconf = get_config_value("gcv", "minconf", 0.60)
+    default_gcv_timeout = get_config_value("gcv", "timeout", 20.0)
+    default_exiftool_path = get_config_value("exiftool", "path", "exiftool")
+    
+    ap.add_argument("--gcv-minconf", type=float, default=default_gcv_minconf, help=f"Confianza mínima para aceptar GCV landmark (default: {default_gcv_minconf})")
+    ap.add_argument("--gcv-timeout", type=float, default=default_gcv_timeout, help=f"Timeout por foto para Vision en segundos (default: {default_gcv_timeout})")
     ap.add_argument("--verbose", action="store_true", help="Imprimir acción por cada foto")
-    ap.add_argument("--exiftool-path", default="exiftool", help="Ruta al binario exiftool (p. ej. /opt/bin/exiftool)")
+    ap.add_argument("--exiftool-path", default=default_exiftool_path, help=f"Ruta al binario exiftool (default: {default_exiftool_path})")
     ap.add_argument("--force", action="store_true",
                     help="Forzar escritura de localización aunque la foto ya tenga GPS")
 

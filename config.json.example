@@ -1,0 +1,18 @@
+{
+  "gcv": {
+    "minconf": 0.60,
+    "timeout": 20.0
+  },
+  "geocoding": {
+    "timeout": 15.0,
+    "max_km_bias": 20.0,
+    "max_km_if_bias": 50.0
+  },
+  "exiftool": {
+    "path": "exiftool"
+  },
+  "output": {
+    "csv_prefix": "result"
+  }
+}
+

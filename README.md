@@ -27,7 +27,7 @@ opkg install exiftool
 # y normalmente queda en /opt/bin/exiftool
 ```
 
-Si no está en el PATH, luego puedes indicar la ruta con `--exiftool-path`.
+Si no está en el PATH, puedes configurarlo en `config.json` o indicar la ruta con `--exiftool-path`.
 
 ### 1.2. Dependencias Python
 
@@ -38,6 +38,50 @@ pip install exifread geopy tqdm requests google-cloud-vision
 pip install pillow imagehash wikipedia charset-normalizer
 pip install beautifulsoup4
 ```
+
+### 1.3. Archivo de configuración (opcional)
+
+El script puede usar un archivo `config.json` para configurar valores por defecto. Si no existe, se usan valores predefinidos.
+
+Copia el archivo de ejemplo y personalízalo:
+
+```bash
+cp config.json.example config.json
+```
+
+Estructura del `config.json`:
+
+```json
+{
+  "gcv": {
+    "minconf": 0.60,
+    "timeout": 20.0
+  },
+  "geocoding": {
+    "timeout": 15.0,
+    "max_km_bias": 20.0,
+    "max_km_if_bias": 50.0
+  },
+  "exiftool": {
+    "path": "exiftool"
+  },
+  "output": {
+    "csv_prefix": "result"
+  }
+}
+```
+
+**Parámetros configurables:**
+
+- `gcv.minconf`: Confianza mínima para aceptar landmarks de Google Cloud Vision (default: 0.60)
+- `gcv.timeout`: Timeout en segundos para llamadas a Vision API (default: 20.0)
+- `geocoding.timeout`: Timeout para geocodificación con Nominatim (default: 15.0)
+- `geocoding.max_km_bias`: Radio máximo en km alrededor del hint del plan (default: 20.0)
+- `geocoding.max_km_if_bias`: Radio máximo para validación en resolución de nombres (default: 50.0)
+- `exiftool.path`: Ruta al binario exiftool (default: "exiftool")
+- `output.csv_prefix`: Prefijo para archivos CSV generados (default: "result")
+
+**Nota:** Los valores pasados por línea de comandos tienen prioridad sobre `config.json`.
 
 ---
 
