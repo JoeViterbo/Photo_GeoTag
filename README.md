@@ -1,137 +1,144 @@
-# Geotag Cascade GCV Multi
+# Geotag Cascade GCV Multi ✅
 
-Script en Python para **geolocalizar automáticamente fotos** usando:
-
-- Google Cloud Vision (landmarks, Web Detection y OCR)
-- Wikipedia + Nominatim (OpenStreetMap) para resolver nombres → coordenadas
-- pHash para reutilizar localizaciones entre fotos parecidas
-- Archivo de plan (`plan.json` o `plan_multi.json`) como **bias** principal (rango de fotos → lugar)
-- Escritura de coordenadas en EXIF/XMP con `exiftool`
-- Reindexado automático en Synology Photos mediante `touch`
-- **Soporte para procesar múltiples carpetas** desde un único archivo JSON
-
-> Pensado para procesar carpetas grandes de fotos de viajes, manteniendo la precisión gracias a un plan de rangos. Ahora también permite procesar múltiples carpetas en batch.
+Breve: script en Python para geolocalizar fotos automáticamente usando Google Cloud Vision (landmarks, web detection, OCR), Wikipedia/Nominatim y pHash. Soporta un plan por rangos (single) y procesamiento por lotes de carpetas (multi). Escribe coordenadas en EXIF/XMP con `exiftool` y genera un CSV con el detalle.
 
 ---
 
-## 1. Requisitos
+## Requisitos rápidos
 
-### 1.1. Dependencias del sistema
-
-- Python 3.9+ (idealmente 3.11 en tu NAS/PC)
-- `exiftool` instalado y accesible en el `PATH`  
-  En Synology (entorno Entware/Optware) suele ser algo como:
+- Python 3.9+ (recomendado 3.11)
+- `exiftool` en PATH o indicar con `--exiftool-path`
+- Instalar dependencias:
 
 ```bash
-opkg install exiftool
-# y normalmente queda en /opt/bin/exiftool
+pip install exifread geopy tqdm requests google-cloud-vision pillow imagehash wikipedia charset-normalizer beautifulsoup4 lxml
 ```
 
-Si no está en el PATH, puedes configurarlo en `config.json` o indicar la ruta con `--exiftool-path`.
+Opcional (desarrollo): `pytest`, `ruff`, `black`.
 
-### 1.2. Dependencias Python
+---
 
-En tu entorno virtual (recomendado):
+## Comportamiento esencial
 
-```bash
-pip install exifread geopy tqdm requests google-cloud-vision
-pip install pillow imagehash wikipedia charset-normalizer
-pip install beautifulsoup4
-```
+- Procesa fotos en orden por fecha (EXIF → mtime).
+- Prioridad de geolocalización por foto:
+  1. Landmark (Google Vision)
+  2. Reuso por pHash
+  3. Web Detection → etiquetas → Wikipedia/Nominatim
+  4. OCR → texto → Wikipedia/Nominatim
+  5. Fallback: `plan.json` (por rango) o `last_known`/`--hint`
+- Si existe plan/hint, se aplica un radio máximo (por defecto **20 km**) para evitar saltos erróneos.
+- Escribe GPS con `exiftool` (verificado tras escritura, con reintentos), hace `touch` y genera `result.csv` o `result_<carpeta>.csv` (multi).
 
-### 1.3. Archivo de configuración (opcional)
+---
 
-El script puede usar un archivo `config.json` para configurar valores por defecto. Si no existe, se usan valores predefinidos.
+## Planes y formatos
 
-Copia el archivo de ejemplo y personalízalo:
+- Single: `plan.json` — lista de tags por índice. Soporta **dos formatos** compatibles:
+  - `{"last": N, "hint": "Lugar"}` — indica que las fotos desde el inicio del bloque anterior + 1 (o 1 para el primer bloque) hasta `N` inclusive se asignan a ese hint.
+  - `{"range": [start,end], "hint": "Lugar"}` — formato antiguo, aún soportado (interpretado como `[start,end]`).
+  Si un índice no está en ningún bloque, se usa el **último hint conocido** como fallback (si existe).
+- Multi: `plan_multi.json` — lista de `{"name","path","tags"}`. Si `path` está vacío se puede usar `--base-path`.
 
-```bash
-cp config.json.example config.json
-```
+---
 
-Estructura del `config.json`:
+## Opciones importantes
+
+- `--file PLAN` / `--multi-plan PLAN_MULTI` — detecta formato automáticamente
+- `--base-path PATH`, `--hint`, `--dry-run`, `--start-index`, `--end-index`
+- `--gcv-minconf`, `--gcv-timeout`, `--exiftool-path`, `--force`, `--verbose`
+- `--path-map OLD:NEW`, `--apply-path-maps`, `--fail-on-missing`
+- `--remove-loc-file FILE` — Ruta a un JSON (array de rutas de carpetas) con carpetas en las que eliminar la geolocalización. Si se pasa, el script mostrará las rutas resueltas y pedirá confirmación interactiva antes de proceder. Usa `--yes` para omitir la confirmación. Respeta `--dry-run` y `--exiftool-path`.
+- Al usar `--remove-loc-file`, el script por defecto intentará eliminar las **mismas etiquetas GPS (EXIF + XMP)** que crea cuando añade localizaciones. Esto permite revertir localizaciones creadas previamente por este mismo script. Usa `--dry-run` para simular y `--yes` para omitir confirmación interactiva.
+- `--yes` — Omitir confirmación interactiva (útil para ejecuciones no interactivas o en scripts automatizados).
+- `--no-override-creds` — no sobrescribir `GOOGLE_APPLICATION_CREDENTIALS` desde `google_geo_tag.json`
+
+---
+
+## Ejemplos rápidos
+
+- Single:
+  `python geotag_cascade_gcv_multi.py /ruta/fotos --file plan.json --verbose`
+- Multi:
+  `python geotag_cascade_gcv_multi.py --file plan_multi.json --base-path /ruta/base --verbose`
+- Dry-run:
+  `python geotag_cascade_gcv_multi.py /ruta/fotos --file plan.json --dry-run`
+
+---
+
+## Eliminar geolocalización (remove_loc.json) 🔧
+
+- Formato: el archivo debe ser un JSON que contenga **solo** un array de rutas (strings). Ejemplo:
 
 ```json
-{
-  "gcv": {
-    "minconf": 0.60,
-    "timeout": 20.0
-  },
-  "geocoding": {
-    "timeout": 15.0,
-    "max_km_bias": 20.0,
-    "max_km_if_bias": 50.0
-  },
-  "exiftool": {
-    "path": "exiftool"
-  },
-  "output": {
-    "csv_prefix": "result"
-  }
-}
+[
+  "/ruta/a/carpeta1",
+  "/otra/carpeta"
+]
 ```
 
-**Parámetros configurables:**
+- Uso básico:
+  - `python geotag_cascade_gcv_multi.py --remove-loc-file remove_loc.json`
+  - `--dry-run` muestra qué se haría sin escribir EXIF.
+  - `--yes` omite la confirmación interactiva y permite ejecución en entornos no interactivos.
 
-- `gcv.minconf`: Confianza mínima para aceptar landmarks de Google Cloud Vision (default: 0.60)
-- `gcv.timeout`: Timeout en segundos para llamadas a Vision API (default: 20.0)
-- `geocoding.timeout`: Timeout para geocodificación con Nominatim (default: 15.0)
-- `geocoding.max_km_bias`: Radio máximo en km alrededor del hint del plan (default: 20.0)
-- `geocoding.max_km_if_bias`: Radio máximo para validación en resolución de nombres (default: 50.0)
-- `exiftool.path`: Ruta al binario exiftool (default: "exiftool")
-- `output.csv_prefix`: Prefijo para archivos CSV generados (default: "result")
+- Comportamiento:
+  - El script **resuelve** todas las rutas primero (expande `~`, `$VARS` y aplica `--path-map`/`DEFAULT_PATH_MAPS`).
+  - Muestra un resumen con cada ruta resuelta y su estado (`EXISTS` / `MISSING`).
+  - Pide confirmación interactiva: "¿Continuar y eliminar geolocalización en las carpetas listadas? [y/N]:". Si contestas no o presionas Enter, la operación se cancela sin tocar nada.
+  - Si confirmas (o si pasas `--yes`), el script recorre las imágenes (no recursivo) y elimina campos GPS EXIF + XMP usando `exiftool` (se hace `touch` para reindexar). Si `exiftool` no está disponible y no usas `--dry-run`, el script falla con error.
 
-**Nota:** Los valores pasados por línea de comandos tienen prioridad sobre `config.json`.
-
----
-
-## 2. Autenticación Google Cloud Vision
-
-El script usa el **SDK oficial de Google Cloud Vision** con transporte REST.
-
-1. Crea un proyecto en Google Cloud.
-2. Activa la API **Cloud Vision**.
-3. Crea una **cuenta de servicio** y descarga el JSON de credenciales.
-4. Exporta la ruta al JSON:
+- Ejemplos:
 
 ```bash
-export GOOGLE_APPLICATION_CREDENTIALS="/ruta/a/tu/credenciales.json"
+# Pregunta y luego ejecuta
+python geotag_cascade_gcv_multi.py --remove-loc-file remove_loc.json
+
+# Ejecutar sin confirmación (útil en scripts)
+python geotag_cascade_gcv_multi.py --remove-loc-file remove_loc.json --yes
+
+# Simular (no escribir)
+python geotag_cascade_gcv_multi.py --remove-loc-file remove_loc.json --dry-run
 ```
 
-En el NAS, esto lo puedes poner en el `.profile` o en el script que lance el entorno.
+- Tests: se añadieron pruebas básicas en `tests/test_remove_loc.py` que simulan aceptar y cancelar la confirmación.
 
 ---
 
-## 3. Estructura general
+## Salida
 
-El script:
-
-1. Lista todos los ficheros de imagen en una carpeta (no recursivo), extensiones:
-   - `.jpg`, `.jpeg`, `.heic`, `.heif`, `.tif`, `.tiff`, `.png`,
-   - `.dng`, `.nef`, `.cr2`, `.arw`, `.rw2`, `.orf`, `.raf`, `.srw`
-2. Ordena las fotos por fecha de captura:
-   - `EXIF DateTimeOriginal` → `Image DateTime` → `mtime`
-3. Para cada foto (a partir de `start_index`, opcionalmente hasta `end_index`):
-   - Obtiene un **bias** de localización:
-     - A partir de `plan.json` (rango → lugar) si se pasó `--file` (formato single)
-     - O desde `plan_multi.json` (múltiples carpetas) si se usa `--file` o `--multi-plan` (formato multi)
-     - O del primer `--hint` global si no hay plan
-   - Intenta localizar usando el siguiente pipeline:
-     1. Google Cloud Vision **Landmarks**
-     2. Reuso de pHash (si otra foto similar ya fue resuelta)
-     3. Web Detection (GCV) → etiquetas → Wikipedia/Nominatim
-     4. OCR (GCV) → texto → Wikipedia/Nominatim
-     5. Si nada anterior funciona:
-        - Usa directamente las coordenadas del hint del `plan.json` para ese índice
-        - O, si no hay plan, `last_known` / `--hint`
-   - En todos los métodos, si hay plan/hint:
-     - se limita la distancia a un radio de **20 km** respecto al bias  
-       (`DEFAULT_MAX_KM_BIAS`) para evitar saltos absurdos (p.ej. Tokio → Osaka).
-4. Escribe las coordenadas en EXIF + XMP con `exiftool`.
-5. Hace `touch` al fichero para que Synology Photos lo reindexe.
-6. Genera siempre un log `result.csv` (o `result_[carpeta].csv` en modo multi) con el detalle de lo hecho.
+- `result.csv` (single) o `result_<carpeta>.csv` (multi)
+- Campos: `file, action, lat, lon, source`
 
 ---
+## Troubleshooting — Synology NAS
+
+- exiftool no encontrado: instala con `opkg install exiftool` o indica la ruta con `--exiftool-path /opt/bin/exiftool` o ajusta `exiftool.path` en `config.json`.
+- Paths montados diferentes: usa `--path-map OLD:NEW` (ej. `/var/services/homes:/volume1/homes`) y `--apply-path-maps` para actualizar el JSON (se hace backup automáticamente).
+- Permisos: asegúrate de que el usuario que ejecuta el script puede leer las fotos y ejecutar `exiftool`.
+- Credenciales: coloca `google_geo_tag.json` en el directorio del script o exporta `GOOGLE_APPLICATION_CREDENTIALS`. Si quieres preservar la variable existente, usa `--no-override-creds`.
+- Synology Photos no reindexa: el script hace `touch`; si no funciona, prueba a forzar reindex o reiniciar el servicio de Photos.
+- Vision API / cuota: revisa el proyecto en Google Cloud (roles, cuotas) y valida que la cuenta de servicio tenga permisos de Vision.
+- Nominatim / rate limit: respeta timeouts y evita consultas masivas; cachea resultados si haces muchas resoluciones.
+
+Consejos de diagnóstico:
+- Ejecuta `--dry-run --verbose` para ver las decisiones sin escribir EXIF.
+- Revisa `result*.csv` para ver por foto la acción tomada.
+
+---
+## Notas
+
+- `DEFAULT_MAX_KM_BIAS` (20 km) evita saltos geográficos erróneos.
+- Si pones `google_geo_tag.json` junto al script, se intentará usarlo automáticamente (se valida como JSON). Añadí `.gitignore` para ese archivo y `.venv`, `__pycache__`.
+- Tests: `python tests/run_simple_tests.py` (sin deps externos) — usar `pytest` para pruebas completas.
+
+**Fallback de hints no resueltos:**
+- Cuando un `hint` no puede resolverse con Nominatim/Wikipedia, el script intentará **geocodificar solo la parte 'país'** (última porción tras la última coma del `hint`). Por ejemplo, `"Mostoles, Spain"` → intentará `"Spain"`.
+- Si la geocodificación por país tiene éxito, se usará esa coordenada y se registrará una entrada `hint_fallback_used:<original>-><country>` en los errores/logs.
+- Si ambos intentos fallan, el script no dispondrá de coordenadas numéricas para ese bloque; en ese caso se guarda un fallback textual (por ejemplo, `"Spain"`) para que el pipeline pueda usar tokens (p. ej. búsqueda de Wikipedia o match por etiquetas) sin imponer una restricción de bias.
+- Logs/errores que puedes ver: `hint_fallback_used:<name>-><country>`, `hint_unresolved:<name>`, `hint_geocode_error:<name>:<error>`.
+
+Si quieres, convierto esto a una versión aún más corta (1 página) o añado un apartado de troubleshooting para Synology NAS.
 
 ## 4. Formatos de archivo de plan
 
@@ -139,19 +146,19 @@ El script **detecta automáticamente** el formato del JSON. Soporta dos tipos:
 
 ### 4.1. Formato Single (`plan.json`) - Una carpeta
 
-Formato tradicional para procesar una sola carpeta. Es una lista de objetos con:
+Formato tradicional para procesar una sola carpeta. Soporta ahora dos formas:
 
-- `range`: `[inicio, fin]` de índices de foto (base 1)
-- `hint`: una descripción de lugar que Nominatim puede resolver (p.ej. `"Tokyo, Japon"`)
+- `{"last": N, "hint": "Lugar"}` — cada entrada indica el **último índice** (inclusive) para ese bloque; los bloques se ordenan por `last` ascendente y el primero comienza en 1. Por ejemplo, `{"last": 14, "hint": "Dublin, Ireland"}` significa que las fotos 1..14 usarán ese hint.
+- `{"range": [inicio, fin], "hint": "Lugar"}` — formato antiguo, todavía válido.
 
-Ejemplo:
+Ejemplos:
 
 ```json
 [
-  { "range": [1, 111],  "hint": "Tokyo, Japon" },
-  { "range": [112, 129], "hint": "Nikko, Japon" },
-  { "range": [130, 186], "hint": "Fujiyoshida, Japon" },
-  { "range": [187, 241], "hint": "Kyoto, Japon" }
+  { "last": 111,  "hint": "Tokyo, Japan" },
+  { "last": 129,  "hint": "Nikko, Japan" },
+  { "last": 186,  "hint": "Fujiyoshida, Japan" },
+  { "last": 241,  "hint": "Kyoto, Japan" }
 ]
 ```
 
@@ -159,9 +166,9 @@ Notas:
 
 - Los índices son **globales, desde 1**, en el orden en el que el script procesa las fotos.
 - El script:
-  - Aplica directamente el hint si la foto cae dentro de un rango.
-  - Si el índice no está en ningún rango:
-    - Usa **siempre el último hint del JSON** como bias.
+  - Asigna a cada foto el hint del bloque correspondiente según `last`/`range`.
+  - Si un índice no está en ningún bloque, usa **el último hint conocido** (si existe) como fallback.
+  - Si un hint no puede resolverse geográficamente, el script intentará un **fallback por país** (ver sección siguiente).
 
 ### 4.2. Formato Multi (`plan_multi.json`) - Múltiples carpetas
 
@@ -283,6 +290,21 @@ python geotag_cascade_gcv_multi.py --multi-plan plan_multi.json --base-path /rut
   Fuerza escritura de localización **aunque la foto ya tenga GPS**.  
   En el log se marcarán esas fotos como `force_overwrite_has_gps`.
 
+- `--path-map OLD:NEW`  
+  Mapea prefijos de ruta cuando las rutas listadas en `plan_multi.json` no coinciden con el montaje actual (útil en NAS con distintos prefijos como `/var/services/homes` vs `/volume1/homes`). Repetible. Ejemplo:
+  ```bash
+  --path-map /var/services/homes:/volume1/homes
+  ```
+
+- `--apply-path-maps`  
+  Aplica los `--path-map` (y los mappings por defecto) directamente al archivo `plan_multi.json` (se hace un backup `.bak` antes de sobrescribir). Útil para arreglar el archivo de forma permanente.
+
+- `--fail-on-missing`  
+  Si hay carpetas listadas en `plan_multi.json` que no existen tras aplicar los mappings, salir con error antes de procesar (por defecto se ignoran y se saltan).
+
+- `--no-override-creds`  
+  Si se pasa, el script **no** sobrescribirá `GOOGLE_APPLICATION_CREDENTIALS` desde `google_geo_tag.json` (si existe), permitiendo que la variable de entorno preexistente tenga prioridad.
+
 ---
 
 ## 6. Ejemplos de uso
@@ -389,9 +411,23 @@ python geotag_cascade_gcv_multi.py \
   --verbose
 ```
 
+python geotag_cascade_gcv_multi.py \
+  --file "plan_multi.json" \
+  --base-path "/var/services/homes/decompetynas/Photos/" \
+  --verbose
+
 Útil en NAS donde `exiftool` puede estar en una ruta no estándar.
 
 ---
+
+## Notas adicionales
+
+- Mappings por defecto: el script incluye un mapping por defecto útil en Synology NAS: `/var/services/homes -> /volume1/homes`.
+- Logging: el script ahora usa el módulo `logging`. Usa `--verbose` para ver mensajes informativos por carpeta/foto.
+- Credenciales: si colocas `google_geo_tag.json` junto al script, se intentará usarlo automáticamente (puedes desactivar ese comportamiento con `--no-override-creds`).
+- Tests: he añadido pruebas simples en `tests/test_multi_plan.py` y un runner `tests/run_simple_tests.py`. Ejecuta `pytest` o `python tests/run_simple_tests.py` para verificar `resolve_folder_path` y `load_multi_plan`.
+
+Si quieres que actualice este README con ejemplos de `plan_multi.json` reales o añadir una sección de troubleshooting para NAS, dime y la incluyo.
 
 ## 7. Salida: `result.csv`
 

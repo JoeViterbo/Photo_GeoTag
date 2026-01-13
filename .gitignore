@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+env/
+ENV/
+venv/
+
+# Byte-compiled / cache
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.coverage
+.cache/
+
+# Editor directories and files
+.vscode/
+.idea/
+.DS_Store
+
+# Build / distribution
+build/
+dist/
+
+# Project-specific sensitive files
+google_geo_tag.json
+
+# Logs
+*.log
+
+# Result files
+result*.csv
